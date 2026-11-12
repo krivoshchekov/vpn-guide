@@ -8,6 +8,7 @@
 
 - Для провайдера это выглядит как заход на обычный российский сайт: российский домен, российский IP, честный сертификат. Кто откроет домен в браузере, увидит страницу входа на «портал».
 - Зарубежный сервер — это выход в интернет. Его IP видят сайты, к нему напрямую никто из пользователей не подключается.
+- У каждого пользователя две ссылки на один и тот же домен: **основная** (VLESS + TLS) и **запасная** (XHTTP, выглядит как обычные запросы к сайту). Если основную начнут резать, человек просто переключается на запасную.
 - Ссылки у пользователей привязаны к домену. Если российский сервер придется сменить, достаточно поменять DNS-запись, пользователям ничего делать не нужно.
 
 ## Что понадобится
@@ -81,9 +82,24 @@ DOMAIN=<ДОМЕН>
 apt update && apt install -y certbot nginx qrencode python3
 bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
 
-# сайт-заглушка на внутреннем порту
+# сайт-заглушка на внутреннем порту; /portal/ передается в запасной вход XHTTP
 cat > /etc/nginx/sites-enabled/default <<'EOF'
-server { listen 127.0.0.1:8080; root /var/www/html; index index.html; }
+server {
+    listen 127.0.0.1:8080;
+    root /var/www/html;
+    index index.html;
+
+    location /portal/ {
+        proxy_pass http://127.0.0.1:8081;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+        client_max_body_size 0;
+    }
+}
 EOF
 systemctl restart nginx
 
@@ -165,6 +181,11 @@ cfg = {
        "certificates": [{"certificateFile": "/usr/local/etc/xray/cert/fullchain.pem",
                          "keyFile": "/usr/local/etc/xray/cert/privkey.pem"}]}},
    "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]}},
+  {"tag": "xhttp", "listen": "127.0.0.1", "port": 8081, "protocol": "vless",
+   "settings": {"clients": [{"id": me, "email": "me"}, {"id": mon, "email": "monitor"}], "decryption": "none"},
+   "streamSettings": {"network": "xhttp", "security": "none",
+     "xhttpSettings": {"path": "/portal", "mode": "packet-up"}},
+   "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]}},
   {"tag": "monitor", "listen": "127.0.0.1", "port": 10808, "protocol": "socks", "settings": {"udp": False}}],
  "outbounds": [
   {"tag": "za", "protocol": "shadowsocks", "settings": {"servers": [{"address": ip_za, "port": 23456,
@@ -173,19 +194,23 @@ cfg = {
   {"tag": "block", "protocol": "blackhole"}]}
 json.dump(cfg, open("/usr/local/etc/xray/config.json", "w"), separators=(",", ":"))
 print("MON_UUID =", mon)
-print("Ваша ссылка:")
+print("Ваша основная ссылка:")
 print(f"vless://{me}@{domain}:443?type=tcp&encryption=none&security=tls&sni={domain}&fp=firefox&alpn=http%2F1.1&flow=xtls-rprx-vision#me")
+print("Запасная ссылка (XHTTP):")
+print(f"vless://{me}@{domain}:443?type=xhttp&security=tls&sni={domain}&fp=firefox&alpn=http%2F1.1&path=%2Fportal&mode=packet-up&encryption=none#me-xhttp")
 EOF
 xray run -test -c /usr/local/etc/xray/config.json && systemctl restart xray && systemctl enable xray && systemctl is-active xray
 ```
 
-Скрипт напечатает `MON_UUID` (запишите, он нужен для мониторинга) и **вашу первую ссылку `vless://…`**.
+Скрипт напечатает `MON_UUID` (запишите, он нужен для мониторинга) и **две ваши ссылки `vless://…`**: основную и запасную.
+
+Как это работает: основной вход на порту 443 принимает VLESS + TLS. Все остальное (браузеры, запросы XHTTP) Xray передает в nginx. nginx показывает заглушку, а запросы на `/portal/…` передает в запасной вход на 8081. Путь `/portal` можно заменить на любой свой, но тогда поменяйте его в трех местах: nginx, конфиг Xray и ссылки.
 
 Проверка:
 ```bash
 curl -s -m 15 -x socks5h://127.0.0.1:10808 https://ifconfig.me; echo   # должен быть <IP_ZA>
 ```
-И снаружи: откройте `https://<ДОМЕН>` в браузере — должна показаться страница входа.
+И снаружи: откройте `https://<ДОМЕН>` в браузере — должна показаться страница входа. Запасной вход проверяется ботом (шаг 6, команда `тест`).
 
 ### 3.4. Удобный вход по SSH (на своем Mac/ПК)
 
@@ -206,6 +231,8 @@ EOF
 - **Mac / Windows:** v2RayTun, Hiddify или v2rayN → импорт ссылки из буфера.
 
 Проверка: подключиться, открыть 2ip.ru — должен показываться `<IP_ZA>` (зарубежный IP).
+
+Добавьте в приложение **обе ссылки**. Пользоваться основной, а если она перестала работать (обычно на мобильном интернете), переключиться на запасную `…-xhttp`. Запасная чуть медленнее, но ее труднее отличить от обычного сайта.
 
 Клиентов удобнее всего добавлять через бота (шаг 6).
 
@@ -341,12 +368,12 @@ bash -x /usr/local/bin/vpn-monitor.sh 2>&1 | grep -E "code=|ip="
 
 Тот же бот будет отвечать на команды (только вам — по chat_id):
 - `тест` — проверить всю цепочку и показать, кто был активен за 15 минут;
-- **логин латиницей** (например `petrov-mob`) или `добавить логин` — создать клиента, бот пришлет ссылку и QR-код;
-- `ключ логин` — прислать ключ существующего клиента;
+- **логин латиницей** (например `petrov-mob`) или `добавить логин` — создать клиента, бот пришлет основную и запасную ссылки и два QR-кода;
+- `ключ логин` — прислать обе ссылки существующего клиента;
 - `удалить логин` — отключить клиента;
 - `список` — все клиенты.
 
-При добавлении и удалении Xray перезапускается, VPN у всех прерывается на 1–2 секунды.
+Клиент добавляется и удаляется сразу в обоих входах, основном и запасном. При добавлении и удалении Xray перезапускается, VPN у всех прерывается на 1–2 секунды.
 
 На **российском** сервере (токен, chat_id, домен, IP и MON_UUID бот берет из `/etc/vpn-monitor.env`, созданного в шаге 5.2):
 
@@ -364,6 +391,7 @@ SOCKS = "socks5h://127.0.0.1:10808"
 DOMAIN = ENV["DOMAIN"].strip("'\"")
 EXIT_IP = ENV["EXIT_IP"].strip("'\"")
 MON_UUID = ENV["MON_UUID"].strip("'\"")
+XPATH = "/portal"
 CONFIG = "/usr/local/etc/xray/config.json"
 LOGIN_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,31}$")
 CLEAN = {k: v for k, v in os.environ.items() if k.lower() not in ("http_proxy", "https_proxy")}
@@ -387,13 +415,19 @@ def tg(method, data=None, timeout=60):
         return {}
 
 
-def full_chain():
+def full_chain(xh=False):
+    user = {"id": MON_UUID, "encryption": "none"}
+    tls = {"serverName": DOMAIN, "fingerprint": "firefox", "alpn": ["http/1.1"]}
+    if xh:
+        ss = {"network": "xhttp", "security": "tls", "tlsSettings": tls,
+              "xhttpSettings": {"path": XPATH, "mode": "packet-up"}}
+    else:
+        user["flow"] = "xtls-rprx-vision"
+        ss = {"network": "tcp", "security": "tls", "tlsSettings": tls}
     cfg = {"log": {"loglevel": "none"},
            "inbounds": [{"listen": "127.0.0.1", "port": 10811, "protocol": "socks"}],
            "outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "127.0.0.1", "port": 443,
-                          "users": [{"id": MON_UUID, "flow": "xtls-rprx-vision", "encryption": "none"}]}]},
-                          "streamSettings": {"network": "tcp", "security": "tls",
-                                             "tlsSettings": {"serverName": DOMAIN, "fingerprint": "firefox", "alpn": ["http/1.1"]}}}]}
+                          "users": [user]}]}, "streamSettings": ss}]}
     open("/tmp/vpn-bot-client.json", "w").write(json.dumps(cfg))
     p = subprocess.Popen(["xray", "run", "-c", "/tmp/vpn-bot-client.json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(2)
@@ -402,7 +436,10 @@ def full_chain():
     return ip
 
 
-def link(uid, login):
+def link(uid, login, xh=False):
+    if xh:
+        return (f"vless://{uid}@{DOMAIN}:443?type=xhttp&security=tls&sni={DOMAIN}&fp=firefox"
+                f"&alpn=http%2F1.1&path=%2Fportal&mode=packet-up&encryption=none#{login}-xhttp")
     return (f"vless://{uid}@{DOMAIN}:443?type=tcp&encryption=none&security=tls&sni={DOMAIN}"
             f"&fp=firefox&alpn=http%2F1.1&flow=xtls-rprx-vision#{login}")
 
@@ -414,6 +451,11 @@ def clients():
 
 
 def apply(c):
+    # запасной вход XHTTP получает тех же клиентов, что и основной
+    main = [i for i in c["inbounds"] if i.get("port") == 443][0]
+    for i in c["inbounds"]:
+        if i.get("tag") == "xhttp":
+            i["settings"]["clients"] = [{"id": x["id"], "email": x["email"]} for x in main["settings"]["clients"]]
     shutil.copy(CONFIG, CONFIG + ".bak")
     json.dump(c, open(CONFIG, "w"), separators=(",", ":"))
     if subprocess.run(["xray", "run", "-test", "-c", CONFIG], capture_output=True).returncode != 0:
@@ -425,13 +467,14 @@ def apply(c):
 
 
 def send_key(login, uid, title):
-    url = link(uid, login)
-    tg("sendMessage", {"chat_id": CHAT, "text": f"{title}\n\n{url}"})
-    png = f"/tmp/qr-{login}.png"
-    if shutil.which("qrencode") and subprocess.run(["qrencode", "-s", "8", "-o", png, url]).returncode == 0:
-        subprocess.run(["curl", "-s", "-m", "60", "-x", SOCKS, f"{API}/sendPhoto", "-F", f"chat_id={CHAT}",
-                        "-F", f"photo=@{png}", "-F", f"caption={login}"], capture_output=True, env=CLEAN)
-        os.remove(png)
+    url, url2 = link(uid, login), link(uid, login, True)
+    tg("sendMessage", {"chat_id": CHAT, "text": f"{title}\n\nОсновной:\n{url}\n\nЗапасной (если основной не работает):\n{url2}"})
+    for u, cap in ((url, login), (url2, f"{login} — запасной")):
+        png = f"/tmp/qr-{login}.png"
+        if shutil.which("qrencode") and subprocess.run(["qrencode", "-s", "8", "-o", png, u]).returncode == 0:
+            subprocess.run(["curl", "-s", "-m", "60", "-x", SOCKS, f"{API}/sendPhoto", "-F", f"chat_id={CHAT}",
+                            "-F", f"photo=@{png}", "-F", f"caption={cap}"], capture_output=True, env=CLEAN)
+            os.remove(png)
 
 
 def cmd_add(login):
@@ -479,7 +522,7 @@ def cmd_list():
 HELP = ("Команды:\n"
         "тест — проверить VPN и показать активных\n"
         "логин (латиницей) или «добавить логин» — новый клиент, пришлю ключ и QR\n"
-        "ключ логин — прислать ключ существующего\n"
+        "ключ логин — прислать ключи существующего (основной и запасной)\n"
         "удалить логин — отключить клиента\n"
         "список — все клиенты\n\n"
         "При добавлении и удалении VPN у всех прерывается на 1–2 секунды.")
@@ -499,7 +542,9 @@ def report():
     ip = sh(f"curl -s -m 15 -x {SOCKS} https://ifconfig.me")
     chk(ip == EXIT_IP, "Связь с зарубежным сервером есть", f"Нет связи с зарубежным сервером (ответ {ip or 'нет'})")
     ip2 = full_chain()
-    chk(ip2 == EXIT_IP, f"Полная цепочка как у клиента: выход {EXIT_IP}", f"Полная цепочка не работает (ответ {ip2 or 'нет'})")
+    chk(ip2 == EXIT_IP, f"Основной вход: выход {EXIT_IP}", f"Основной вход не работает (ответ {ip2 or 'нет'})")
+    ip3 = full_chain(True)
+    chk(ip3 == EXIT_IP, f"Запасной вход XHTTP: выход {EXIT_IP}", f"Запасной вход XHTTP не работает (ответ {ip3 or 'нет'})")
     end = sh(f"echo | openssl s_client -connect 127.0.0.1:443 -servername {DOMAIN} 2>/dev/null | openssl x509 -noout -enddate | cut -d= -f2")
     if end:
         days = (datetime.datetime.strptime(end, "%b %d %H:%M:%S %Y %Z") - datetime.datetime.utcnow()).days
@@ -578,11 +623,43 @@ systemctl daemon-reload && systemctl enable --now vpn-bot && sleep 2 && systemct
 
 ---
 
+## Если VPN уже настроен по старой версии инструкции
+
+Как добавить запасной вход XHTTP к работающей схеме:
+
+1. На российском сервере замените `/etc/nginx/sites-enabled/default` блоком из шага 3.1 (строки от `cat > /etc/nginx/sites-enabled/default` до `EOF`) и выполните `nginx -t && systemctl reload nginx`.
+2. Добавьте вход XHTTP с теми же клиентами:
+   ```bash
+   cp /usr/local/etc/xray/config.json /usr/local/etc/xray/config.json.bak
+   python3 - <<'EOF'
+   import json
+   p = "/usr/local/etc/xray/config.json"
+   c = json.load(open(p))
+   main = [i for i in c["inbounds"] if i.get("port") == 443][0]
+   c["inbounds"] = [i for i in c["inbounds"] if i.get("tag") != "xhttp"]
+   c["inbounds"].insert(1, {"tag": "xhttp", "listen": "127.0.0.1", "port": 8081, "protocol": "vless",
+       "settings": {"clients": [{"id": x["id"], "email": x["email"]} for x in main["settings"]["clients"]],
+                    "decryption": "none"},
+       "streamSettings": {"network": "xhttp", "security": "none",
+                          "xhttpSettings": {"path": "/portal", "mode": "packet-up"}},
+       "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]}})
+   json.dump(c, open(p, "w"), separators=(",", ":"))
+   print("ok")
+   EOF
+   xray run -test -c /usr/local/etc/xray/config.json && systemctl restart xray && systemctl is-active xray
+   ```
+3. Обновите бота: заново выполните блок из шага 6 (файл `vpn-bot.py`) и `systemctl restart vpn-bot`. Команда `ключ логин` пришлет каждому его запасную ссылку.
+
+Если что-то сломалось: `cp /usr/local/etc/xray/config.json.bak /usr/local/etc/xray/config.json && systemctl restart xray`.
+
+---
+
 ## Если не работает
 
 1. **Что пишет бот?** Сообщение без пометки — от российского сервера, `[Заграница]` — от зарубежного.
-2. **Проверьте на той же сети другой VPN.** Если другие VPN работают, а ваш нет — оператор, вероятно, режет адреса вашего российского хостера: возьмите VPS у другого российского хостера, перенесите настройки (шаг 3) и поменяйте DNS-запись `A`. Ссылки у людей менять не придется. Если не работает вообще ничего — у оператора, скорее всего, режим «белых списков»; ждать или использовать Wi‑Fi.
-3. **На российском сервере:**
+2. **Попробуйте запасную ссылку `…-xhttp`.** Если она работает, а основная нет — оператор режет основной протокол; пока пользуйтесь запасной.
+3. **Проверьте на той же сети другой VPN.** Если другие VPN работают, а ваш нет — оператор, вероятно, режет адреса вашего российского хостера: возьмите VPS у другого российского хостера, перенесите настройки (шаг 3) и поменяйте DNS-запись `A`. Ссылки у людей менять не придется. Если не работает вообще ничего — у оператора, скорее всего, режим «белых списков»; ждать или использовать Wi‑Fi.
+4. **На российском сервере:**
    ```bash
    systemctl is-active xray
    journalctl -u xray --since "5 min ago" --no-pager | grep -v accepted | tail -20
@@ -595,10 +672,10 @@ systemctl daemon-reload && systemctl enable --now vpn-bot && sleep 2 && systemct
 - **Простой проброс портов** (iptables DNAT) с российского сервера на зарубежный — режется.
 - **VLESS без шифрования** между серверами — новые версии Xray его не запускают. Shadowsocks 2022 проходит.
 - **«Российские сайты напрямую» на сервере** (маршрутизация по geosite/geoip) — в простом варианте с `IPIfNonMatch` у нас сломала все сайты. Если очень нужно — включайте только аккуратно, на тестовом порту, с `IPOnDemand` и правилом «заблокированные сайты выше российских».
+- **Fallback по пути в Xray для XHTTP** (`"fallbacks": [{"path": "/portal", ...}]`) — не работает: Xray сравнивает путь точно, а XHTTP добавляет к нему свой хвост (`/portal/<id>/0`), и запросы уходят в заглушку с ошибкой 404. Передавайте путь через nginx, как в шаге 3.1.
 - **Прокси в окружении сервера.** Если в `~/.bashrc` прописан `HTTPS_PROXY`, все `curl`-проверки начнут врать — уберите.
 - **Не пересылайте никому** токен бота, ключ Shadowsocks и ссылки других пользователей. Каждому человеку — свой ключ.
 
 ## Возможные улучшения
 
 - Второй IP или второй зарубежный сервер как запасной выход — на случай блокировки основного.
-- Транспорт XHTTP вместо TCP, если начнутся «заморозки» соединений (потребует обновить ссылки у всех).

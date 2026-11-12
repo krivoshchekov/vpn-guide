@@ -10,6 +10,7 @@ SOCKS = "socks5h://127.0.0.1:10808"
 DOMAIN = ENV["DOMAIN"].strip("'\"")
 EXIT_IP = ENV["EXIT_IP"].strip("'\"")
 MON_UUID = ENV["MON_UUID"].strip("'\"")
+XPATH = "/portal"
 CONFIG = "/usr/local/etc/xray/config.json"
 LOGIN_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,31}$")
 CLEAN = {k: v for k, v in os.environ.items() if k.lower() not in ("http_proxy", "https_proxy")}
@@ -33,13 +34,19 @@ def tg(method, data=None, timeout=60):
         return {}
 
 
-def full_chain():
+def full_chain(xh=False):
+    user = {"id": MON_UUID, "encryption": "none"}
+    tls = {"serverName": DOMAIN, "fingerprint": "firefox", "alpn": ["http/1.1"]}
+    if xh:
+        ss = {"network": "xhttp", "security": "tls", "tlsSettings": tls,
+              "xhttpSettings": {"path": XPATH, "mode": "packet-up"}}
+    else:
+        user["flow"] = "xtls-rprx-vision"
+        ss = {"network": "tcp", "security": "tls", "tlsSettings": tls}
     cfg = {"log": {"loglevel": "none"},
            "inbounds": [{"listen": "127.0.0.1", "port": 10811, "protocol": "socks"}],
            "outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "127.0.0.1", "port": 443,
-                          "users": [{"id": MON_UUID, "flow": "xtls-rprx-vision", "encryption": "none"}]}]},
-                          "streamSettings": {"network": "tcp", "security": "tls",
-                                             "tlsSettings": {"serverName": DOMAIN, "fingerprint": "firefox", "alpn": ["http/1.1"]}}}]}
+                          "users": [user]}]}, "streamSettings": ss}]}
     open("/tmp/vpn-bot-client.json", "w").write(json.dumps(cfg))
     p = subprocess.Popen(["xray", "run", "-c", "/tmp/vpn-bot-client.json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(2)
@@ -48,7 +55,10 @@ def full_chain():
     return ip
 
 
-def link(uid, login):
+def link(uid, login, xh=False):
+    if xh:
+        return (f"vless://{uid}@{DOMAIN}:443?type=xhttp&security=tls&sni={DOMAIN}&fp=firefox"
+                f"&alpn=http%2F1.1&path=%2Fportal&mode=packet-up&encryption=none#{login}-xhttp")
     return (f"vless://{uid}@{DOMAIN}:443?type=tcp&encryption=none&security=tls&sni={DOMAIN}"
             f"&fp=firefox&alpn=http%2F1.1&flow=xtls-rprx-vision#{login}")
 
@@ -60,6 +70,11 @@ def clients():
 
 
 def apply(c):
+    # запасной вход XHTTP получает тех же клиентов, что и основной
+    main = [i for i in c["inbounds"] if i.get("port") == 443][0]
+    for i in c["inbounds"]:
+        if i.get("tag") == "xhttp":
+            i["settings"]["clients"] = [{"id": x["id"], "email": x["email"]} for x in main["settings"]["clients"]]
     shutil.copy(CONFIG, CONFIG + ".bak")
     json.dump(c, open(CONFIG, "w"), separators=(",", ":"))
     if subprocess.run(["xray", "run", "-test", "-c", CONFIG], capture_output=True).returncode != 0:
@@ -71,13 +86,14 @@ def apply(c):
 
 
 def send_key(login, uid, title):
-    url = link(uid, login)
-    tg("sendMessage", {"chat_id": CHAT, "text": f"{title}\n\n{url}"})
-    png = f"/tmp/qr-{login}.png"
-    if shutil.which("qrencode") and subprocess.run(["qrencode", "-s", "8", "-o", png, url]).returncode == 0:
-        subprocess.run(["curl", "-s", "-m", "60", "-x", SOCKS, f"{API}/sendPhoto", "-F", f"chat_id={CHAT}",
-                        "-F", f"photo=@{png}", "-F", f"caption={login}"], capture_output=True, env=CLEAN)
-        os.remove(png)
+    url, url2 = link(uid, login), link(uid, login, True)
+    tg("sendMessage", {"chat_id": CHAT, "text": f"{title}\n\nОсновной:\n{url}\n\nЗапасной (если основной не работает):\n{url2}"})
+    for u, cap in ((url, login), (url2, f"{login} — запасной")):
+        png = f"/tmp/qr-{login}.png"
+        if shutil.which("qrencode") and subprocess.run(["qrencode", "-s", "8", "-o", png, u]).returncode == 0:
+            subprocess.run(["curl", "-s", "-m", "60", "-x", SOCKS, f"{API}/sendPhoto", "-F", f"chat_id={CHAT}",
+                            "-F", f"photo=@{png}", "-F", f"caption={cap}"], capture_output=True, env=CLEAN)
+            os.remove(png)
 
 
 def cmd_add(login):
@@ -125,7 +141,7 @@ def cmd_list():
 HELP = ("Команды:\n"
         "тест — проверить VPN и показать активных\n"
         "логин (латиницей) или «добавить логин» — новый клиент, пришлю ключ и QR\n"
-        "ключ логин — прислать ключ существующего\n"
+        "ключ логин — прислать ключи существующего (основной и запасной)\n"
         "удалить логин — отключить клиента\n"
         "список — все клиенты\n\n"
         "При добавлении и удалении VPN у всех прерывается на 1–2 секунды.")
@@ -145,7 +161,9 @@ def report():
     ip = sh(f"curl -s -m 15 -x {SOCKS} https://ifconfig.me")
     chk(ip == EXIT_IP, "Связь с зарубежным сервером есть", f"Нет связи с зарубежным сервером (ответ {ip or 'нет'})")
     ip2 = full_chain()
-    chk(ip2 == EXIT_IP, f"Полная цепочка как у клиента: выход {EXIT_IP}", f"Полная цепочка не работает (ответ {ip2 or 'нет'})")
+    chk(ip2 == EXIT_IP, f"Основной вход: выход {EXIT_IP}", f"Основной вход не работает (ответ {ip2 or 'нет'})")
+    ip3 = full_chain(True)
+    chk(ip3 == EXIT_IP, f"Запасной вход XHTTP: выход {EXIT_IP}", f"Запасной вход XHTTP не работает (ответ {ip3 or 'нет'})")
     end = sh(f"echo | openssl s_client -connect 127.0.0.1:443 -servername {DOMAIN} 2>/dev/null | openssl x509 -noout -enddate | cut -d= -f2")
     if end:
         days = (datetime.datetime.strptime(end, "%b %d %H:%M:%S %Y %Z") - datetime.datetime.utcnow()).days
