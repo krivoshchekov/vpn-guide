@@ -368,7 +368,7 @@ bash -x /usr/local/bin/vpn-monitor.sh 2>&1 | grep -E "code=|ip="
 
 Тот же бот будет отвечать на команды (только вам — по chat_id):
 - `тест` — проверить всю цепочку и показать, кто был активен за 15 минут;
-- **логин латиницей** (например `petrov-mob`) или `добавить логин` — создать клиента, бот пришлет основную и запасную ссылки и два QR-кода;
+- **логин латиницей** (например `petrov-mob`) или `добавить логин` — создать клиента, бот пришлет основную и запасную ссылки и их QR-коды отдельными сообщениями (нажатие на ссылку копирует ее);
 - `ключ логин` — прислать обе ссылки существующего клиента;
 - `удалить логин` — отключить клиента;
 - `список` — все клиенты.
@@ -381,7 +381,7 @@ bash -x /usr/local/bin/vpn-monitor.sh 2>&1 | grep -E "code=|ip="
 cat > /usr/local/bin/vpn-bot.py <<'EOF'
 #!/usr/bin/env python3
 # Бот проверки VPN: на сообщение «тест» проверяет цепочку и показывает активных клиентов.
-import json, os, re, shutil, subprocess, time, datetime, uuid
+import html, json, os, re, shutil, subprocess, time, datetime, uuid
 
 ENV = dict(l.strip().split("=", 1) for l in open("/etc/vpn-monitor.env") if "=" in l)
 TOKEN = ENV["BOT_TOKEN"].strip("'\"")
@@ -467,13 +467,14 @@ def apply(c):
 
 
 def send_key(login, uid, title):
-    url, url2 = link(uid, login), link(uid, login, True)
-    tg("sendMessage", {"chat_id": CHAT, "text": f"{title}\n\nОсновной:\n{url}\n\nЗапасной (если основной не работает):\n{url2}"})
-    for u, cap in ((url, login), (url2, f"{login} — запасной")):
+    # заголовок отдельно, затем каждая ссылка — отдельным сообщением (нажатие копирует), затем ее QR
+    tg("sendMessage", {"chat_id": CHAT, "text": title})
+    for u in (link(uid, login), link(uid, login, True)):
+        tg("sendMessage", {"chat_id": CHAT, "text": f"<code>{html.escape(u)}</code>", "parse_mode": "HTML"})
         png = f"/tmp/qr-{login}.png"
         if shutil.which("qrencode") and subprocess.run(["qrencode", "-s", "8", "-o", png, u]).returncode == 0:
             subprocess.run(["curl", "-s", "-m", "60", "-x", SOCKS, f"{API}/sendPhoto", "-F", f"chat_id={CHAT}",
-                            "-F", f"photo=@{png}", "-F", f"caption={cap}"], capture_output=True, env=CLEAN)
+                            "-F", f"photo=@{png}"], capture_output=True, env=CLEAN)
             os.remove(png)
 
 
@@ -483,13 +484,13 @@ def cmd_add(login):
     c, cl = clients()
     for x in cl:
         if x.get("email") == login:
-            send_key(login, x["id"], f"ℹ️ {login} уже есть, вот его ключ:")
+            send_key(login, x["id"], f"ℹ️ {login} уже есть, его ключи (основной и запасной):")
             return None
     uid = str(uuid.uuid4())
     cl.append({"id": uid, "flow": "xtls-rprx-vision", "email": login})
     if not apply(c):
         return "❌ Не удалось применить настройки, ничего не изменено."
-    send_key(login, uid, f"✅ Клиент {login} добавлен. Ключ:")
+    send_key(login, uid, f"✅ Клиент {login} добавлен. Основной и запасной ключи:")
     return None
 
 
@@ -497,7 +498,7 @@ def cmd_key(login):
     _, cl = clients()
     for x in cl:
         if x.get("email") == login:
-            send_key(login, x["id"], f"🔑 Ключ {login}:")
+            send_key(login, x["id"], f"🔑 {login}: основной и запасной ключи")
             return None
     return f"Клиента {login} нет. Список — команда «список»."
 
