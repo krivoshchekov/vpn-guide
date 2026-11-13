@@ -362,6 +362,50 @@ bash -x /usr/local/bin/vpn-monitor.sh 2>&1 | grep -E "code=|ip="
 ```
 Должно быть `{"ok":true`, `code=200`, `ip=<IP_ZA>`.
 
+### 5.4. Дубль уведомлений на почту (рекомендуется)
+
+Если VPN упал, Telegram на телефоне может не открыться, и тревогу вы не увидите. Поэтому те же сообщения стоит дублировать письмом себе на почту: приложение Яндекс Почты или Mail.ru работает без VPN. Российский сервер отправляет письмо напрямую, без туннеля, поэтому оно дойдет и при обрыве связи с зарубежным сервером.
+
+1. Создайте **пароль приложения** (обычный пароль не подойдет):
+   - Яндекс: в настройках Почты → «Почтовые программы» включите доступ по IMAP; затем id.yandex.ru → «Безопасность» → «Пароли приложений» → «Почта»;
+   - Mail.ru: «Настройки» → «Безопасность» → «Пароли для внешних приложений».
+2. На сервере вставьте **отдельно** эту строку и ответьте на два вопроса (пароль при вводе не виден). На зарубежном сервере вместо `TAG=Москва` напишите `TAG=Заграница`:
+   ```bash
+   read -p "Адрес почты: " MAIL; read -s -p "Пароль приложения: " PASS; echo; TAG=Москва
+   ```
+
+3. Затем в том же окне вставьте блок:
+
+```bash
+for p in 465 587; do timeout 6 bash -c "</dev/tcp/smtp.yandex.ru/$p" && echo "порт $p открыт" || echo "порт $p закрыт"; done
+case "$MAIL" in *@yandex.*|*@ya.ru) SMTP=smtps://smtp.yandex.ru:465;; *@mail.ru|*@inbox.ru|*@list.ru|*@bk.ru) SMTP=smtps://smtp.mail.ru:465;; *) SMTP=""; echo "НЕ ЯНДЕКС И НЕ MAIL.RU";; esac
+printf "SMTP_URL='%s'\nMAIL_USER='%s'\nMAIL_PASS='%s'\nMAIL_TO='%s'\nMAIL_TAG='%s'\n" "$SMTP" "$MAIL" "$PASS" "$MAIL" "$TAG" > /etc/vpn-mail.env
+chmod 600 /etc/vpn-mail.env; unset PASS
+cat > /usr/local/bin/vpn-mail.sh <<'EOF'
+#!/bin/bash
+# vpn-mail.sh "текст" — письмо о состоянии VPN (дублирует уведомления Telegram)
+source /etc/vpn-mail.env   # SMTP_URL, MAIL_USER, MAIL_PASS, MAIL_TO, MAIL_TAG
+t="$1"
+case "$t" in ✅*) s="VPN работает";; 🧪*) s="VPN: проверка почты";; *) s="VPN: проблема";; esac
+s="$s [$MAIL_TAG]"
+printf 'From: %s\r\nTo: %s\r\nSubject: =?UTF-8?B?%s?=\r\nDate: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n[%s] %s\r\n' \
+  "$MAIL_USER" "$MAIL_TO" "$(printf '%s' "$s" | base64 -w0)" "$(LC_ALL=C date -R)" "$MAIL_TAG" "$t" |
+curl -sS -m 30 --noproxy '*' --ssl-reqd --url "$SMTP_URL" --user "$MAIL_USER:$MAIL_PASS" \
+  --mail-from "$MAIL_USER" --mail-rcpt "$MAIL_TO" --upload-file -
+EOF
+chmod 700 /usr/local/bin/vpn-mail.sh
+cp /usr/local/bin/vpn-monitor.sh /usr/local/bin/vpn-monitor.sh.bak
+grep -q vpn-mail /usr/local/bin/vpn-monitor.sh || sed -i 's|^send() {|send() { /usr/local/bin/vpn-mail.sh "$1" >/dev/null 2>\&1;|' /usr/local/bin/vpn-monitor.sh
+bash -n /usr/local/bin/vpn-monitor.sh && echo "скрипт в порядке"
+/usr/local/bin/vpn-mail.sh "🧪 Проверка: так придет письмо, если VPN сломается" && echo "ПИСЬМО ОТПРАВЛЕНО"
+```
+
+Должно прийти письмо «VPN: проверка почты [Москва]». Загляните в «Спам» и отметьте «Не спам». В приложении почты на телефоне включите уведомления.
+
+Если оба порта закрыты (`Connection timed out`), хостер блокирует исходящую почту — так бывает у зарубежных VPS. Напишите в поддержку с просьбой открыть исходящие порты 465 и 587. Пока они закрыты, мониторинг работает как раньше, просто без писем.
+
+Бот в мессенджере MAX для этого не подходит: MAX выдает ботов только проверенным организациям, частному лицу его не создать.
+
 ---
 
 ## Шаг 6. Бот-администратор
@@ -657,7 +701,7 @@ systemctl daemon-reload && systemctl enable --now vpn-bot && sleep 2 && systemct
 
 ## Если не работает
 
-1. **Что пишет бот?** Сообщение без пометки — от российского сервера, `[Заграница]` — от зарубежного.
+1. **Что пишет бот** (или письмо на почте, если Telegram не открывается)? Сообщение без пометки — от российского сервера, `[Заграница]` — от зарубежного.
 2. **Попробуйте запасную ссылку `…-xhttp`.** Если она работает, а основная нет — оператор режет основной протокол; пока пользуйтесь запасной.
 3. **Проверьте на той же сети другой VPN.** Если другие VPN работают, а ваш нет — оператор, вероятно, режет адреса вашего российского хостера: возьмите VPS у другого российского хостера, перенесите настройки (шаг 3) и поменяйте DNS-запись `A`. Ссылки у людей менять не придется. Если не работает вообще ничего — у оператора, скорее всего, режим «белых списков»; ждать или использовать Wi‑Fi.
 4. **На российском сервере:**
